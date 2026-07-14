@@ -22,7 +22,7 @@ import traceback
 from datetime import datetime, timedelta
 from multiprocessing import Pool, cpu_count
 from const import PREDICT_STEP, TIME_FORMAT, MINUTE_WATT
-from utils import calc_percent_limit, dp0, dp1, dp2, dp3, dp4, remove_intersecting_windows, calc_percent_limit, in_car_slot
+from utils import calc_percent_limit, dp0, dp1, dp2, dp3, dp4, remove_intersecting_windows, calc_percent_limit, in_car_slot, time_string_to_stamp
 from prediction import Prediction, wrapped_run_prediction_single, wrapped_run_prediction_charge, wrapped_run_prediction_charge_min_max, wrapped_run_prediction_export, wrapped_run_prediction_charge_min_max
 from prediction_kernel import kernel_status_summary
 from predbat_metrics import metrics
@@ -1019,20 +1019,13 @@ class Plan:
             if clipping_start_override is None:
                 start_time_str = self.get_arg("clipping_buffer_start_time", default="None")
                 if start_time_str and start_time_str != "None":
-                    clipping_start_override = self.time_to_minutes(start_time_str)
+                    _ts = time_string_to_stamp(start_time_str)
+                    clipping_start_override = _ts.hour * 60 + _ts.minute if _ts else None
                     self.clipping_buffer_start = clipping_start_override
             if clipping_start_override is not None:
                 early_start = midnight + clipping_start_override
 
-            # If stretching back, ensure we don't stretch into periods of negative import rates
-            # where the optimizer might want to charge the battery.
-            if early_start < morning_start:
-                test_start = morning_start
-                while test_start > early_start:
-                    if getattr(self, "rate_import", {}).get(test_start - 30, 9999) <= 0:
-                        break
-                    test_start -= 30
-                morning_start = test_start
+            morning_start = min(morning_start, early_start)
             morning_start = max(self.minutes_now, morning_start)
 
             morning_start = int(morning_start / 30) * 30  # Align to nearest 30 mins
@@ -1371,11 +1364,13 @@ class Plan:
 
             self.clipping_buffer_start = None
             if start_time_str and start_time_str != "None":
-                self.clipping_buffer_start = self.time_to_minutes(start_time_str)
+                _ts = time_string_to_stamp(start_time_str)
+                self.clipping_buffer_start = _ts.hour * 60 + _ts.minute if _ts else None
 
             self.clipping_buffer_end = None
             if end_time_str and end_time_str != "None":
-                self.clipping_buffer_end = self.time_to_minutes(end_time_str)
+                _ts = time_string_to_stamp(end_time_str)
+                self.clipping_buffer_end = _ts.hour * 60 + _ts.minute if _ts else None
 
             # Calculate Implicit Buffer (Physics-based Decay Curve)
             self.clipping_buffer_forecast_kwh = {}
@@ -1793,20 +1788,6 @@ class Plan:
         # Start the loop at the max soc setting
         if self.best_soc_max > 0:
             loop_soc = min(loop_soc, self.best_soc_max)
-        # Cap charge limit to preserve clipping headroom during active clipping export windows
-        clip_target = None
-        check_windows = all_n if all_n else [window_n]
-        for w_n in check_windows:
-            start_cw = charge_window[w_n]["start"]
-            end_cw = charge_window[w_n]["end"]
-            for e_win in export_window:
-                if "clipping_target_soc_pct" in e_win:
-                    if end_cw >= e_win["start"] and start_cw <= e_win["end"]:
-                        tgt = e_win["clipping_target_soc_pct"]
-                        clip_target = min(clip_target, tgt) if clip_target is not None else tgt
-
-        if clip_target is not None:
-            loop_soc = min(loop_soc, clip_target)
 
         # Create min/max SoC to avoid simulating SoC that are not going have any impact
         # Can't do this for anything but a single window as the winder SoC impact isn't known
@@ -3077,8 +3058,6 @@ class Plan:
         swapped_target = {}
         curr = self.currency_symbols[1]
 
-        if self.calculate_best_export:
-            record_export_windows = min(record_export_windows, len(self.export_window_best))
         if self.calculate_best_export and record_export_windows >= 1:
             swapped = True
             while swapped:
@@ -3404,8 +3383,7 @@ class Plan:
             if not self.calculate_export_oncharge:
                 hit_export = self.hit_charge_window(self.export_window_best, self.charge_window_best[charge_window_n]["start"], self.charge_window_best[charge_window_n]["end"])
                 if hit_export >= 0 and self.export_limits_best[hit_export] < 100:
-                    if "clipping_target_soc_pct" not in self.export_window_best[hit_export]:
-                        return False
+                    return False
             return True
         return False
 
@@ -3468,7 +3446,7 @@ class Plan:
             if (count % 16) == 0:
                 self.log("Final optimisation type {} window {} metric {} metric_keep {} best_carbon {} best_import {} cost {}".format(typ, window_n, best_metric, dp2(best_keep), dp0(best_carbon), dp2(best_import), dp2(best_cost)))
             count += 1
-        self.log("Second pass optimisation finished metric {} cost {} metric_keep {} cycle {} carbon {} import {}".format(best_metric, dp2(best_cost), dp2(best_keep), dp2(best_cycle), dp0(best_carbon), dp2(best_import)))
+        self.log("Second pass optimisation finished metric {} cost {} metric_keep {} cycle {} carbon {} import {}".format(best_metric, dp2(best_cost), dp2(best_keep), dp2(best_cycle), dp0(best_carbon), dp2(best_carbon)))
 
         self.plan_write_debug(debug_mode, "plan_pass2.html", self.pv_forecast_minute_step, self.pv_forecast_minute10_step, self.load_minutes_step, self.load_minutes_step10, self.end_record)
         return best_metric, best_cost, best_keep, best_soc_min, best_cycle, best_carbon, best_import, best_battery_value
@@ -4886,7 +4864,7 @@ class Plan:
             if save and save == "debug":
                 self.dashboard_item(
                     self.prefix + ".pv_power_debug",
-                    state=dp3(self.filtered_today(predict_pv_power, stamp=self.now_utc) or 0),
+                    state=dp3(final_soc),
                     attributes={
                         "results": self.filtered_times(predict_pv_power),
                         "today": self.filtered_today(predict_pv_power),
@@ -4898,7 +4876,7 @@ class Plan:
                 )
                 self.dashboard_item(
                     self.prefix + ".grid_power_debug",
-                    state=dp3(self.filtered_today(predict_grid_power, stamp=self.now_utc) or 0),
+                    state=dp3(final_soc),
                     attributes={
                         "results": self.filtered_times(predict_grid_power),
                         "today": self.filtered_today(predict_grid_power),
@@ -4910,7 +4888,7 @@ class Plan:
                 )
                 self.dashboard_item(
                     self.prefix + ".load_power_debug",
-                    state=dp3(self.filtered_today(predict_load_power, stamp=self.now_utc) or 0),
+                    state=dp3(final_soc),
                     attributes={
                         "results": self.filtered_times(predict_load_power),
                         "today": self.filtered_today(predict_load_power),
@@ -4922,7 +4900,7 @@ class Plan:
                 )
                 self.dashboard_item(
                     self.prefix + ".battery_power_debug",
-                    state=dp3(self.filtered_today(predict_battery_power, stamp=self.now_utc) or 0),
+                    state=dp3(final_soc),
                     attributes={
                         "results": self.filtered_times(predict_battery_power),
                         "today": self.filtered_today(predict_battery_power),
